@@ -13,39 +13,40 @@ import (
     {{- if .UsedTypedAPI }}
     "gorm.io/cli/gorm/typed"
     {{- end }}
-    {{range .Imports -}}
+    {{range .TemplateImports -}}
     {{.ImportPath}}
     {{end -}}
 )
 
 {{range .Interfaces}}
-{{$IfaceName := .IfaceName}}
-func {{.Name}}[T any](db *gorm.DB, opts ...clause.Expression) {{$IfaceName}}Interface[T] {
-    return {{$IfaceName}}Impl[T]{
+{{$InterfaceName := .GeneratedInterfaceName}}
+{{$ImplName := .GeneratedImplName}}
+func {{.GeneratedConstructorName}}[T any](db *gorm.DB, opts ...clause.Expression) {{$InterfaceName}}[T] {
+    return {{$ImplName}}[T]{
         Interface: {{if $.UsedTypedAPI}}typed{{else}}gorm{{end}}.G[T](db, opts...),
     }
 }
 
-type {{$IfaceName}}Interface[T any] interface {
+type {{$InterfaceName}}[T any] interface {
     {{if $.UsedTypedAPI}}typed{{else}}gorm{{end}}.Interface[T]
     {{range .Methods -}}
     {{.Name}}({{.ParamsString}}) ({{.ResultString}})
     {{end}}
 }
 
-type {{$IfaceName}}Impl[T any] struct {
+type {{$ImplName}}[T any] struct {
     {{if $.UsedTypedAPI}}typed{{else}}gorm{{end}}.Interface[T]
 }
 
 {{range .Methods}}
-func (e {{$IfaceName}}Impl[T]) {{.Name}}({{.ParamsString}}) ({{.ResultString}}) {
+func (e {{$ImplName}}[T]) {{.Name}}({{.ParamsString}}) ({{.ResultString}}) {
 	{{.Body}}
 }
 {{end}}
 {{end}}
 
 {{range .Structs}}
-var {{.Name}} = struct {
+var {{.GeneratedName}} = struct {
 	{{range .Fields -}}
 	{{.Name}} {{.Type}}
 	{{end}}

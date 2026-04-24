@@ -10,16 +10,19 @@ var defaultOutPath = "./g"
 
 func New() *cobra.Command {
 	var typed bool
-	var input, output string
+	var samePackage bool
+	var input, output, suffix string
 
 	cmd := &cobra.Command{
 		Use:   "gen",
 		Short: "Generate GORM query code from raw SQL interfaces",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			g := Generator{
-				Typed:   typed,
-				Files:   map[string]*File{},
-				outPath: output,
+				Typed:       typed,
+				Files:       map[string]*File{},
+				outPath:     output,
+				samePackage: samePackage,
+				suffix:      suffix,
 			}
 
 			err := g.Process(input)
@@ -39,6 +42,8 @@ func New() *cobra.Command {
 	cmd.Flags().BoolVarP(&typed, "typed", "t", true, "Generated Typed API")
 	cmd.Flags().StringVarP(&output, "output", "o", defaultOutPath, "Directory to place generated code")
 	cmd.Flags().StringVarP(&input, "input", "i", "", "Path to Go interface file with raw SQL annotations")
+	cmd.Flags().BoolVar(&samePackage, "is-same-package", false, "Generate code in the same package as the source")
+	cmd.Flags().StringVar(&suffix, "same-package-suffix", "", "Suffix to append to generated file names and type names (e.g., 'gen' to get 'model_gen.go' and 'UserGen')")
 	cobra.CheckErr(cmd.MarkFlagRequired("input"))
 
 	return cmd

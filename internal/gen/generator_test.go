@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"text/template"
 )
@@ -128,6 +129,106 @@ type Entity interface {
 	withoutExcludeFile := writeSample(withoutExcludeDir, false)
 	if err := runGen(withoutExcludeFile); err == nil {
 		t.Fatalf("expected generator failure when interface is not excluded")
+	}
+}
+
+func TestSamePackageWithSuffixes(t *testing.T) {
+	samePackageDir, err := filepath.Abs("../../examples/samepackage")
+	if err != nil {
+		t.Fatalf("failed to get absolute path: %v", err)
+	}
+
+	tests := []struct {
+		name           string
+		cliSuffix      string
+		wantSuffix     string // suffix in generated file names, e.g. "gen" → "query_gen.go"
+		wantTypeSuffix string // suffix appended to generated type names, e.g. "Gen" → "IProductQueryGen"
+	}{
+		{
+			name:           "default suffix from config",
+			cliSuffix:      "",
+			wantSuffix:     "gen",
+			wantTypeSuffix: "Gen",
+		},
+		{
+			name:           "cli suffix overrides config",
+			cliSuffix:      "custom",
+			wantSuffix:     "custom",
+			wantTypeSuffix: "Custom",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			g := &Generator{
+				Files:       map[string]*File{},
+				outPath:     defaultOutPath,
+				samePackage: false,
+				suffix:      tc.cliSuffix,
+				Typed:       true,
+			}
+
+			if err := g.Process(samePackageDir); err != nil {
+				t.Fatalf("Process error: %v", err)
+			}
+			if err := g.Gen(); err != nil {
+				t.Fatalf("Gen error: %v", err)
+			}
+
+			// Collect generated files and register cleanup.
+			generatedFiles, err := filepath.Glob(filepath.Join(samePackageDir, fmt.Sprintf("*_%s.go", tc.wantSuffix)))
+			if err != nil {
+				t.Fatalf("glob error: %v", err)
+			}
+			t.Cleanup(func() {
+				for _, f := range generatedFiles {
+					os.Remove(f)
+				}
+			})
+
+			if len(generatedFiles) == 0 {
+				t.Fatalf("no files generated with suffix _%s in %s", tc.wantSuffix, samePackageDir)
+			}
+
+			for _, genFile := range generatedFiles {
+				content, err := os.ReadFile(genFile)
+				if err != nil {
+					t.Fatalf("failed to read generated file %s: %v", genFile, err)
+				}
+
+				if _, err := parser.ParseFile(token.NewFileSet(), genFile, content, parser.AllErrors); err != nil {
+					t.Errorf("generated file %s has invalid Go syntax: %v", genFile, err)
+				}
+
+				contentStr := string(content)
+
+				// File must be in the same package as the source.
+				if !strings.Contains(contentStr, "package samepackage") {
+					t.Errorf("generated file %s should declare package samepackage", filepath.Base(genFile))
+				}
+
+				// Self-package import must be absent (same-package generation).
+				if strings.Contains(contentStr, `"gorm.io/cli/gorm/examples/samepackage"`) {
+					t.Errorf("generated file %s must not import its own package", filepath.Base(genFile))
+				}
+
+				// Type references must be un-prefixed (e.g. "[]Product", not "[]samepackage.Product").
+				if strings.Contains(contentStr, "samepackage.") {
+					t.Errorf("generated file %s must not reference own package by name, got: %s", filepath.Base(genFile), contentStr)
+				}
+			}
+
+			// Verify that the query file's generated constructor uses the expected suffix.
+			queryGen := filepath.Join(samePackageDir, fmt.Sprintf("query_%s.go", tc.wantSuffix))
+			queryContent, err := os.ReadFile(queryGen)
+			if err != nil {
+				t.Fatalf("expected generated query file %s: %v", queryGen, err)
+			}
+			expectedConstructor := fmt.Sprintf("func IProductQuery%s[", tc.wantTypeSuffix)
+			if !strings.Contains(string(queryContent), expectedConstructor) {
+				t.Errorf("expected constructor %q in %s, got:\n%s", expectedConstructor, queryGen, string(queryContent))
+			}
+		})
 	}
 }
 

@@ -60,4 +60,12 @@ type Config struct {
 	// ExcludeStructs is an optional blacklist for struct types to skip.
 	// Applied after IncludeStructs filtering. Same selector rules as IncludeStructs.
 	ExcludeStructs []any
+
+	// IsSamePackage generates code in the same package as the source file.
+	IsSamePackage bool
+
+	// SamePackageSuffix is appended to both generated file names and generated type names.
+	// Example: "gen" generates "model_gen.go" and "UserGen".
+	// Defaults to "gen" when IsSamePackage is true and no suffix is specified.
+	SamePackageSuffix string
 }

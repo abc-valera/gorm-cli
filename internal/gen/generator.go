@@ -23,9 +23,11 @@ import (
 
 type (
 	Generator struct {
-		Typed   bool
-		Files   map[string]*File
-		outPath string
+		Typed       bool
+		Files       map[string]*File
+		outPath     string
+		samePackage bool
+		suffix      string
 	}
 	File struct {
 		ToPackage         string
@@ -51,6 +53,7 @@ type (
 		Doc       string
 		Methods   []*Method
 		err       error
+		file      *File
 	}
 	Method struct {
 		Name      string
@@ -68,6 +71,7 @@ type (
 		Name   string
 		Doc    string
 		Fields []Field
+		file   *File
 	}
 	Field struct {
 		Name        string
@@ -197,8 +201,43 @@ func (g *Generator) Gen() error {
 			continue
 		}
 
-		outPath = filepath.Join(outPath, file.relPath)
-		file.ToPackage = filepath.Base(filepath.Dir(outPath))
+		// Determine output file path and check if config overrides are available.
+		// Config values override defaults but CLI flags take precedence.
+		samePackage := g.samePackage
+		suffix := g.suffix
+		for _, cfg := range file.applicableConfigs {
+			if !g.samePackage && cfg.IsSamePackage {
+				samePackage = cfg.IsSamePackage
+			}
+			if g.suffix == "" && cfg.SamePackageSuffix != "" {
+				suffix = cfg.SamePackageSuffix
+			}
+		}
+
+		if samePackage {
+			// Generate in the same directory as the source file
+			dir := filepath.Dir(file.inputPath)
+			baseName := filepath.Base(file.inputPath)
+			ext := filepath.Ext(baseName)
+			nameWithoutExt := strings.TrimSuffix(baseName, ext)
+
+			// Use the default suffix value if not provided
+			if suffix == "" {
+				suffix = "gen"
+			}
+			nameWithoutExt = nameWithoutExt + "_" + suffix
+
+			outPath = filepath.Join(dir, nameWithoutExt+ext)
+			file.ToPackage = file.Package
+		} else {
+			outPath = filepath.Join(outPath, file.relPath)
+			file.ToPackage = filepath.Base(filepath.Dir(outPath))
+		}
+
+		// Update file's generator suffix for template access
+		if suffix != "" {
+			file.Generator.suffix = suffix
+		}
 
 		var results bytes.Buffer
 		if err := tmpl.Execute(&results, file); err != nil {
@@ -281,9 +320,67 @@ func (p Import) ImportPath() string {
 	return fmt.Sprintf("%s %q", p.Name, p.Path)
 }
 
+// TemplateImports omits self imports for the same package generation.
+func (f *File) TemplateImports() []Import {
+	var filtered []Import
+	for _, imp := range f.Imports {
+		// Skip self-import when generating in the same package
+		if f.ToPackage == f.Package && imp.Path == f.PackagePath {
+			continue
+		}
+		filtered = append(filtered, imp)
+	}
+	return filtered
+}
+
 // GoFullType returns the complete Go type string for a parameter
 func (p Param) GoFullType() string {
 	return p.Type
+}
+
+func (m Method) stripSamePackagePrefix(typeName string) string {
+	if m.Interface.file == nil {
+		return typeName
+	}
+
+	file := m.Interface.file
+	// Only strip prefix when generating in the same package
+	if file.ToPackage != file.Package || file.PackagePath == "" {
+		return typeName
+	}
+
+	// Strip the package prefix if it matches the current package
+	// Handle both short name (e.g., "samepackage.Product") and full path prefixes
+	packagePrefix := file.Package + "."
+	fullPathPrefix := file.PackagePath + "."
+
+	// Try to strip short package prefix first
+	if after, found := strings.CutPrefix(typeName, packagePrefix); found {
+		return after
+	}
+
+	// Try to strip full path prefix
+	if after, found := strings.CutPrefix(typeName, fullPathPrefix); found {
+		return after
+	}
+
+	// Handle slice types: []packagename.Type -> []Type
+	if strings.HasPrefix(typeName, "[]") {
+		stripped := m.stripSamePackagePrefix(typeName[2:])
+		if stripped != typeName[2:] {
+			return "[]" + stripped
+		}
+	}
+
+	// Handle pointer types: *packagename.Type -> *Type
+	if strings.HasPrefix(typeName, "*") {
+		stripped := m.stripSamePackagePrefix(typeName[1:])
+		if stripped != typeName[1:] {
+			return "*" + stripped
+		}
+	}
+
+	return typeName
 }
 
 // ParamsString formats method parameters as a string for code generation
@@ -297,7 +394,8 @@ func (m Method) ParamsString() string {
 			p.Name = "ctx"
 		}
 
-		parts = append(parts, fmt.Sprintf("%s %s", p.Name, p.GoFullType()))
+		typeStr := m.stripSamePackagePrefix(p.GoFullType())
+		parts = append(parts, fmt.Sprintf("%s %s", p.Name, typeStr))
 	}
 
 	if !hasCtx {
@@ -312,12 +410,13 @@ func (m Method) ResultString() string {
 	if m.SQL.Raw != "" {
 		var rets []string
 		for _, r := range m.Result {
-			rets = append(rets, r.GoFullType())
+			typeStr := m.stripSamePackagePrefix(r.GoFullType())
+			rets = append(rets, typeStr)
 		}
 
 		return strings.Join(rets, ", ")
 	}
-	return fmt.Sprintf("%sInterface[T]", m.Interface.IfaceName)
+	return fmt.Sprintf("%s[T]", m.Interface.GeneratedInterfaceName())
 }
 
 // Body generates the method body code for templates
@@ -350,7 +449,7 @@ return e.Exec(ctx, sb.String(), _params...)`, sqlSnippet)
 	return fmt.Sprintf(`%s
 var result %s
 err := e.Raw(sb.String(), _params...).Scan(ctx, &result)
-return result, err`, sqlSnippet, m.Result[0].GoFullType())
+return result, err`, sqlSnippet, m.stripSamePackagePrefix(m.Result[0].GoFullType()))
 }
 
 // chainMethodBody generates method body for chaining SQL operations that return interface
@@ -468,6 +567,50 @@ func (f Field) Type() string {
 	}
 
 	return fmt.Sprintf("field.Field[%s]", filepath.Base(goType))
+}
+
+// capitalizedSuffix returns the suffix with its first letter uppercased.
+func capitalizedSuffix(suffix string) string {
+	if suffix == "" {
+		return ""
+	}
+	r := []rune(suffix)
+	r[0] = unicode.ToUpper(r[0])
+	return string(r)
+}
+
+// GeneratedName appends the suffix to the struct name if configured
+func (s Struct) GeneratedName() string {
+	if s.file != nil && s.file.Generator.suffix != "" {
+		return s.Name + capitalizedSuffix(s.file.Generator.suffix)
+	}
+	return s.Name
+}
+
+// GeneratedConstructorName appends the suffix to the constructor func if configured
+func (i Interface) GeneratedConstructorName() string {
+	if i.file != nil && i.file.Generator.suffix != "" {
+		return i.Name + capitalizedSuffix(i.file.Generator.suffix)
+	}
+	return i.Name
+}
+
+// GeneratedInterfaceName appends the suffix to the generated interface name if configured
+func (i Interface) GeneratedInterfaceName() string {
+	if i.file != nil && i.file.Generator.suffix != "" {
+		baseName := strings.TrimPrefix(i.IfaceName, "_")
+		return "_" + baseName + capitalizedSuffix(i.file.Generator.suffix) + "Interface"
+	}
+	return i.IfaceName + "Interface"
+}
+
+// GeneratedImplName appends the suffix to the generated implementation struct name if configured
+func (i Interface) GeneratedImplName() string {
+	if i.file != nil && i.file.Generator.suffix != "" {
+		baseName := strings.TrimPrefix(i.IfaceName, "_")
+		return "_" + baseName + capitalizedSuffix(i.file.Generator.suffix)
+	}
+	return i.IfaceName + "Impl"
 }
 
 // Value returns the field value string with column name for template generation
@@ -599,6 +742,12 @@ func (p *File) parseConfigLiteral(cl *ast.CompositeLit) *genconfig.Config {
 			cfg.IncludeStructs = append(cfg.IncludeStructs, collect(kv.Value)...)
 		case "ExcludeStructs":
 			cfg.ExcludeStructs = append(cfg.ExcludeStructs, collect(kv.Value)...)
+		case "IsSamePackage":
+			if ident, ok := kv.Value.(*ast.Ident); ok {
+				cfg.IsSamePackage = ident.Name == "true"
+			}
+		case "SamePackageSuffix":
+			cfg.SamePackageSuffix = strLit(kv.Value)
 		}
 	}
 	return cfg
@@ -610,6 +759,7 @@ func (p *File) processInterfaceType(n *ast.TypeSpec, data *ast.InterfaceType) In
 		Name:      n.Name.Name,
 		IfaceName: "_" + n.Name.Name,
 		Doc:       n.Doc.Text(),
+		file:      p,
 	}
 
 	methods := data.Methods.List
@@ -659,6 +809,7 @@ func (p *File) processInterfaceType(n *ast.TypeSpec, data *ast.InterfaceType) In
 func (p *File) processStructType(typeSpec *ast.TypeSpec, data *ast.StructType, pkgName string) Struct {
 	s := Struct{
 		Name: typeSpec.Name.Name,
+		file: p,
 	}
 
 	for _, field := range data.Fields.List {
